@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -7,23 +8,21 @@ module Constellation.Node.Api where
 import ClassyPrelude hiding (delete, log)
 import Control.Monad (void)
 import Data.Aeson
-    (FromJSON(parseJSON), ToJSON(toJSON), Value(Object), (.:), (.=), object)
+    ( FromJSON(parseJSON), ToJSON(toJSON), Value(Object)
+    , (.:), (.:?), (.=), object
+    )
 import Data.Binary (encode, decodeOrFail)
-import Data.HashMap.Strict ((!))
+import Data.ByteArray.Encoding (Base(Base64), convertFromBase)
 import Data.IP (IP(IPv4, IPv6), toHostAddress, toHostAddress6)
 import Data.Maybe (fromJust)
 import Data.Set (Set)
 import Data.Text.Format (Shown(Shown))
-import Network.HTTP.Types (Header, HeaderName, RequestHeaders)
-import Network.HTTP.Types.Header (hContentLength)
+import Network.HTTP.Types (HeaderName, RequestHeaders)
 import Network.Socket
     (SockAddr(SockAddrInet, SockAddrInet6), HostAddress, HostAddress6)
 import Text.Read (read)
 import qualified Data.Aeson as AE
-import qualified Data.ByteString.Base64 as B64
-import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
-import qualified Data.HashMap.Strict as HM
 import qualified Data.Set as Set
 import qualified Data.Text.Encoding as TE
 import qualified Network.Wai as Wai
@@ -33,22 +32,24 @@ import Constellation.Enclave.Payload
 import Constellation.Enclave.Types (PublicKey, mkPublicKey)
 import Constellation.Node
 import Constellation.Node.Types
-import Constellation.Util.ByteString (mustB64DecodeBs, mustB64TextDecodeBs)
+import Constellation.Util.ByteString (mustB64DecodeBs)
+import Constellation.Util.Http (getHeaderValues, getHeaderCommaValues)
+import Constellation.Util.Json (JsonBs(..), unJsonBs)
 import Constellation.Util.Logging (debugf, warnf)
 import Constellation.Util.Wai
     (ok, badRequest, unauthorized, internalServerError)
 
 data Send = Send
     { sreqPayload :: ByteString
-    , sreqFrom    :: PublicKey
+    , sreqFrom    :: Maybe PublicKey
     , sreqTo      :: [PublicKey]
     } deriving (Eq, Show)
 
 instance FromJSON Send where
     parseJSON (Object v) = Send
-        <$> (mustB64TextDecodeBs <$> v .: "payload")
-        <*> v .: "from"
-        <*> v .: "to"
+        <$> (unJsonBs <$> v .: "payload")
+        <*> v .:? "from"
+        <*> v .:  "to"
     parseJSON _          = mzero
 
 data SendResponse = SendResponse
@@ -57,17 +58,18 @@ data SendResponse = SendResponse
 
 instance ToJSON SendResponse where
     toJSON SendResponse{..} = object
-        ["key" .= sresKey]
+        [ "key" .= sresKey
+        ]
 
 data Receive = Receive
     { rreqKey :: Text
-    , rreqTo  :: PublicKey
+    , rreqTo  :: Maybe PublicKey
     } deriving (Show)
 
 instance FromJSON Receive where
     parseJSON (Object v) = Receive
-        <$> v .: "key"
-        <*> v .: "to"
+        <$> v .:  "key"
+        <*> v .:? "to"
     parseJSON _          = mzero
 
 data ReceiveResponse = ReceiveResponse
@@ -76,7 +78,7 @@ data ReceiveResponse = ReceiveResponse
 
 instance ToJSON ReceiveResponse where
     toJSON ReceiveResponse{..} = object
-        [ "payload" .= TE.decodeUtf8 (B64.encode rresPayload)
+        [ "payload" .= JsonBs rresPayload
         ]
 
 data Delete = Delete
@@ -117,6 +119,7 @@ data ApiType = Public
              | Private
 
 data ApiRequest = ApiSend Send
+                | ApiSendRaw Send
                 | ApiReceive Receive
                 | ApiReceiveRaw Receive
                 | ApiDelete Delete
@@ -127,6 +130,7 @@ data ApiRequest = ApiSend Send
                 deriving (Show)
 
 data ApiResponse = ApiSendR SendResponse
+                 | ApiSendRawR SendResponse
                  | ApiReceiveR ReceiveResponse
                  | ApiReceiveRawR ReceiveResponse
                  | ApiDeleteR DeleteResponse
@@ -142,44 +146,48 @@ data Whitelist = Whitelist
     } deriving Show
 
 hFrom :: HeaderName
-hFrom = "from"
+hFrom = "c11n-from"
 
 hTo :: HeaderName
-hTo = "to"
+hTo = "c11n-to"
+
+hKey :: HeaderName
+hKey = "c11n-key"
 
 decodeSendRaw :: BL.ByteString -> RequestHeaders -> Either String Send
-decodeSendRaw b h = case getHeaders [hContentLength, hFrom, hTo] h of
-    Right headers -> Right Send
-                    { sreqPayload = decodePayload (hmap ! hContentLength) b
-                    , sreqFrom    = mustDecodeB64PublicKey $ hmap ! hFrom
-                    , sreqTo      = decodePublicKeys $ hmap ! hTo
-                    }
-                    where hmap = HM.fromList headers
-    Left err      -> Left err
+decodeSendRaw b h =
+    case onePublicKeyFromHeaderValues $ getHeaderValues hFrom h of
+        Left err    -> Left err
+        Right mfrom -> Right Send
+            { sreqPayload = toStrict b
+            , sreqFrom    = mfrom
+            , sreqTo      = map mustDecodeB64PublicKey $
+                            getHeaderCommaValues hTo h
+            }
 
-decodePayload :: ByteString -> BL.ByteString -> ByteString
-decodePayload h = toStrict . take (read $ BC.unpack h :: Int64)
+onePublicKeyFromHeaderValues :: [ByteString] -> Either String (Maybe PublicKey)
+onePublicKeyFromHeaderValues []        = Right Nothing
+onePublicKeyFromHeaderValues [fromB64] = case convertFromBase Base64 fromB64 of
+    Left err   -> Left err
+    Right from -> case mkPublicKey from of
+        Nothing  -> Left "onePublicKeyFromHeaderValues: Invalid public key"
+        Just pub -> Right $ Just pub
+onePublicKeyFromHeaderValues _         =
+    Left "onePublicKeyFromHeaderValues: More than one value given"
 
 mustDecodeB64PublicKey :: ByteString -> PublicKey
 mustDecodeB64PublicKey = fromJust . mkPublicKey . mustB64DecodeBs
 
-decodePublicKeys :: ByteString -> [PublicKey]
-decodePublicKeys = (map mustDecodeB64PublicKey) . (BC.split ',')
-
-getHeaders :: [HeaderName] -> RequestHeaders -> Either String RequestHeaders
-getHeaders names headers =
-    foldl' (\acc name -> case getHeader name headers of
-               Just h  -> (case acc of
-                             Right xs -> Right $ h:xs
-                             err      -> err)
-               Nothing -> Left $ "Missing header: " ++ show name
-           ) (Right []) names
-
-getHeader :: HeaderName -> RequestHeaders -> Maybe Header
-getHeader hname headers =
-    case (filter (\(header, _) -> header == hname) headers) of
-        (x):_ -> Just x
-        _     -> Nothing
+decodeReceiveRaw :: RequestHeaders -> Either String Receive
+decodeReceiveRaw h = case getHeaderCommaValues hKey h of
+    []  -> Left "decodeReceiveRaw: Key header not found"
+    [k] -> case onePublicKeyFromHeaderValues $ getHeaderValues hTo h of
+        Left err  -> Left err
+        Right mto -> Right Receive
+            { rreqKey = TE.decodeUtf8 k
+            , rreqTo  = mto
+            }
+    _   -> Left "decodeReceiveRaw: More than one Key value given"
 
 whitelist :: [String] -> Whitelist
 whitelist strs = Whitelist
@@ -198,12 +206,12 @@ whitelisted Whitelist{..} (SockAddrInet6 _ _ addr _) = addr `Set.member` wlIPv6
 -- SockAddrUnix connects to the private API which has a Nothing whitelist
 whitelisted _             _                          = False
 
-app :: Maybe Whitelist -> ApiType -> TVar Node -> Wai.Application
-app (Just wl) apiType nvar req resp =
+apiApp :: Maybe Whitelist -> ApiType -> TVar Node -> Wai.Application
+apiApp (Just wl) apiType nvar req resp =
     if whitelisted wl (Wai.remoteHost req)
         then request apiType nvar req resp
         else resp unauthorized
-app Nothing   apiType nvar req resp =
+apiApp Nothing   apiType nvar req resp =
     request apiType nvar req resp
 
 request :: ApiType -> TVar Node -> Wai.Application
@@ -242,11 +250,11 @@ parseRequest :: [Text] -> BL.ByteString -> RequestHeaders -> Either String ApiRe
 -----
 -- Node client
 -----
-parseRequest ["send"]       b _ = ApiSend <$> AE.eitherDecode' b
-parseRequest ["receive"]    b _ = ApiReceive <$> AE.eitherDecode' b
-parseRequest ["sendRaw"]    b h = ApiSend <$> decodeSendRaw b h
-parseRequest ["receiveRaw"] b _ = ApiReceiveRaw <$> AE.eitherDecode' b
-parseRequest ["delete"]     b _ = ApiDelete <$> AE.eitherDecode' b
+parseRequest ["send"]       b _ = ApiSend       <$> AE.eitherDecode' b
+parseRequest ["receive"]    b _ = ApiReceive    <$> AE.eitherDecode' b
+parseRequest ["sendraw"]    b h = ApiSendRaw    <$> decodeSendRaw b h
+parseRequest ["receiveraw"] _ h = ApiReceiveRaw <$> decodeReceiveRaw h
+parseRequest ["delete"]     b _ = ApiDelete     <$> AE.eitherDecode' b
 -----
 -- Node to node
 -----
@@ -265,6 +273,7 @@ parseRequest _              _ _ = Left "Not found"
 
 authorizedRequest :: ApiType -> ApiRequest -> Bool
 authorizedRequest Private (ApiSend _)       = True
+authorizedRequest Private (ApiSendRaw _)    = True
 authorizedRequest Private (ApiReceive _)    = True
 authorizedRequest Private (ApiReceiveRaw _) = True
 authorizedRequest Private (ApiDelete _)     = True
@@ -276,6 +285,7 @@ authorizedRequest _       _                 = False
 
 performRequest :: TVar Node -> ApiRequest -> IO (Either String ApiResponse)
 performRequest nvar (ApiSend sreq)       = readTVarIO nvar >>= \node -> fmap ApiSendR       <$> send node sreq
+performRequest nvar (ApiSendRaw sreq)    = readTVarIO nvar >>= \node -> fmap ApiSendRawR    <$> send node sreq
 performRequest nvar (ApiReceive rreq)    = readTVarIO nvar >>= \node -> fmap ApiReceiveR    <$> receive node rreq
 performRequest nvar (ApiReceiveRaw rreq) = readTVarIO nvar >>= \node -> fmap ApiReceiveRawR <$> receive node rreq
 performRequest nvar (ApiDelete dreq)     = readTVarIO nvar >>= \node -> fmap ApiDeleteR     <$> delete node dreq
@@ -286,6 +296,7 @@ performRequest _    ApiUpcheck           = return $ Right ApiUpcheckR
 
 response :: ApiResponse -> BL.ByteString
 response (ApiSendR sres)                        = AE.encode sres
+response (ApiSendRawR SendResponse{..})         = BL.fromStrict $ TE.encodeUtf8 sresKey
 response (ApiReceiveR rres)                     = AE.encode rres
 response (ApiReceiveRawR ReceiveResponse{..})   = BL.fromStrict rresPayload
 response (ApiDeleteR DeleteResponse)            = ""
@@ -309,9 +320,9 @@ send node Send{..} = do
         else return $ Left $ "sendRequest: Errors while running sendPayload: " ++ show eks
 
 receive :: Node -> Receive -> IO (Either String ReceiveResponse)
-receive node Receive{..} = do
-    epl <- receivePayload node rreqKey rreqTo
-    case epl of
+receive node Receive{..} = case rreqTo <|> nodeDefaultPub node of
+    Nothing -> return $ Left "receive: No To public key given and no default is set"
+    Just to -> receivePayload node rreqKey to >>= \case
         Left err -> return $ Left err
         Right pl -> return $ Right ReceiveResponse
             { rresPayload = pl

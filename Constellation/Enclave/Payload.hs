@@ -51,9 +51,12 @@ encrypt pl sender pk rcpts = encrypt' pl sender cks
   where
     cks = map (safeBeforeNM sender pk) rcpts
 
-safeBeforeNM :: Box.PublicKey -> Box.SecretKey -> Box.PublicKey -> Box.CombinedKey
+safeBeforeNM :: Box.PublicKey
+             -> Box.SecretKey
+             -> Box.PublicKey
+             -> Box.CombinedKey
 safeBeforeNM sender pk rcpt
-    | sender == rcpt = error "encrypt: Sender cannot be a recipient"
+    | sender == rcpt = error "safeBeforeNM: Sender cannot be a recipient"
     | otherwise      = Box.beforeNM pk rcpt
 
 encrypt' :: ByteString

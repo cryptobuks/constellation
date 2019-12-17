@@ -1,6 +1,5 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE StrictData #-}
 module Constellation.Configure.Main where
 
@@ -12,5 +11,4 @@ defaultMain :: IO ()
 defaultMain = runInputT defaultSettings configure
 
 configure :: MonadIO m => InputT m ()
-configure = do
-    putStrLn "hi"
+configure = putStrLn "The configuration tool hasn't been implemented yet"

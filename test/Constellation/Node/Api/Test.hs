@@ -4,46 +4,38 @@
 module Constellation.Node.Api.Test where
 
 import ClassyPrelude hiding (encodeUtf8)
-import Control.Concurrent (forkIO)
 import Data.Maybe (fromJust)
 import Data.IP (toHostAddress, toHostAddress6)
 import Data.Text.Encoding (encodeUtf8)
 import Network.Socket (SockAddr(SockAddrInet, SockAddrInet6, SockAddrUnix, SockAddrCan))
-import Network.HTTP.Types (Header, RequestHeaders)
 import Network.HTTP.Types.Header (hContentLength)
-import System.IO.Temp (withSystemTempDirectory)
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit ((@?=), testCase, testCaseSteps)
+import Test.Tasty.HUnit ((@?=), testCase)
 import Text.Read (read)
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy.Char8 as BLC
-import qualified Network.Wai.Handler.Warp as Warp
 
 import Constellation.Enclave.Types (PublicKey, mkPublicKey)
-import Constellation.Node (nodeRefresh)
-import Constellation.Node.Api (ApiType(..), Send(..))
-import Constellation.Node.Types (Node(nodeStorage), Storage(closeStorage))
+import Constellation.Node.Api
+    ( Send(..), hFrom, hTo, whitelist, whitelisted, decodeSendRaw
+    , mustDecodeB64PublicKey
+    )
 import Constellation.Util.ByteString (mustB64TextDecodeBs)
-import qualified Constellation.Node.Api as NodeApi
 
-import Constellation.TestUtil (kvTest, setupTestNode, link, testSendPayload)
+import Constellation.TestUtil (kvTest, withThreeTestNodes, testSendPayload)
 
 tests :: TestTree
 tests = testGroup "Constellation.Node.Api"
     [ testWhitelist
     , testSendAndReceivePayload
-    , testGetHeader
-    , testGetHeaderInvalid
-    , testDecodePayload
     , testMustDecodeB64PublicKey
-    , testDecodePublicKeys
     , testDecodeSendRaw
     ]
 
 testWhitelist :: TestTree
 testWhitelist = testCase "whitelist" $ do
-    let wled = NodeApi.whitelisted wl
-        wl   = NodeApi.whitelist
+    let wled = whitelisted wl
+        wl   = whitelist
             [ "10.0.0.1"
             , "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
             ]
@@ -55,71 +47,17 @@ testWhitelist = testCase "whitelist" $ do
     wled (SockAddrCan 42) @?= False
 
 testSendAndReceivePayload :: TestTree
-testSendAndReceivePayload = testCaseSteps "sendAndReceivePayload" $ \step ->
-    withSystemTempDirectory "constellation-test-XXX" $ \d -> do
-        step "Setting up nodes"
-        (node1Var, port1) <- setupTestNode d "node1"
-        (node2Var, port2) <- setupTestNode d "node2"
-        (node3Var, port3) <- setupTestNode d "node3"
-        tid1 <- forkIO $ Warp.run port1 $ NodeApi.app Nothing Private node1Var
-        tid2 <- forkIO $ Warp.run port2 $ NodeApi.app Nothing Private node2Var
-        tid3 <- forkIO $ Warp.run port3 $ NodeApi.app Nothing Private node3Var
-
-        step "Linking nodes"
-        atomically $ do
-            link node1Var node2Var
-            link node2Var node3Var
-
-        let nvars = [node1Var, node2Var, node3Var]
-        step "Refreshing nodes"
-        mapM_ nodeRefresh nvars  -- Once to discover the first nodes
-        mapM_ nodeRefresh nvars  -- Twice to receive updated info
-        mapM_ nodeRefresh nvars  -- Thrice to check that nothing is crazy
-
-        -- step "Ensuring the nodes form a network"
-        -- TODO
-        -- forM_ nvars $ \nvar -> readTVarIO nvar >>= \node ->
-        --     putStrLn "" >> print (nodePi node)
-
-        step "Sending a payload from node1 to node2"
-        testSendPayload node1Var node2Var
-        
-        -- step "Ensuring that node3 didn't receive the payload"
-        -- TODO
-        
-        step "Cleaning up"
-        killThread tid1
-        killThread tid2
-        killThread tid3
-        nodes <- atomically $ mapM readTVar [node1Var, node2Var, node3Var]
-        mapM_ (closeStorage . nodeStorage) nodes
-
-header1 :: Header
-header1 = ("h1", BC.pack "payload1")
-
-header2 :: Header
-header2 = ("h2", BC.pack "payload2")
-
-headers :: RequestHeaders
-headers = [header1, header2]
-
-testGetHeader :: TestTree
-testGetHeader = testCase "getHeader" $
-    NodeApi.getHeader "h1" headers @?= Just header1
-
-testGetHeaderInvalid :: TestTree
-testGetHeaderInvalid = testCase "getHeaderInvalid" $
-    NodeApi.getHeader "invalid" headers @?= Nothing
+testSendAndReceivePayload = testCase "sendAndReceivePayload" $
+    withThreeTestNodes $ \(nvar1, nvar2, nvar3) -> do
+        -- TODO Ensure the nodes form a network
+        testSendPayload nvar1 nvar2
+        -- TODO "Ensure that node3 didn't receive the payload"
 
 pl :: String
 pl = "payload"
 
 pll :: ByteString
 pll = (BC.pack . show . length) pl
-
-testDecodePayload :: TestTree
-testDecodePayload  = testCase "readPayload" $
-    NodeApi.decodePayload pll (BLC.pack $ pl ++ " ") @?= BC.pack pl
 
 pk1t :: Text
 pk1t = "BULeR8JyUWhiuuCMU/HLA0Q5pzkYT+cHII3ZKBey3Bo="
@@ -144,21 +82,17 @@ mustB64TextMkPublicKey = fromJust . mkPublicKey . mustB64TextDecodeBs
 
 testMustDecodeB64PublicKey :: TestTree
 testMustDecodeB64PublicKey = kvTest "mustDecodeB64PublicKey"
-    [(pk1bs, pk1)] NodeApi.mustDecodeB64PublicKey
-
-testDecodePublicKeys :: TestTree
-testDecodePublicKeys = kvTest "decodePublicKeys"
-    [((encodeUtf8 $ pk1t ++ "," ++ pk2t), [pk1, pk2])] NodeApi.decodePublicKeys
+    [(pk1bs, pk1)]
+    mustDecodeB64PublicKey
 
 testDecodeSendRaw :: TestTree
 testDecodeSendRaw = testCase "decodeSendRaw" $
-    (NodeApi.decodeSendRaw
+    decodeSendRaw
          (BLC.pack pl)
-         [(hContentLength, pll), (NodeApi.hFrom, pk1bs), (NodeApi.hTo, pk2bs)]
-    ) @?=
-    (Right $ NodeApi.Send
+         [(hContentLength, pll), (hFrom, pk1bs), (hTo, pk2bs)]
+    @?=
+    Right Send
         { sreqPayload = BC.pack pl
-        , sreqFrom    = pk1
+        , sreqFrom    = Just pk1
         , sreqTo      = [pk2]
         }
-    )

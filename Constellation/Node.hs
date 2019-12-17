@@ -5,12 +5,10 @@
 module Constellation.Node where
 
 import ClassyPrelude
+import Control.Exception (evaluate)
+import Control.Monad.Except (ExceptT(ExceptT), runExceptT)
 import Data.Binary (encode, decode)
-import Network.HTTP.Conduit ( RequestBody(RequestBodyLBS)
-                            , newManager, managerConnCount, tlsManagerSettings
-                            , parseRequest, httpLbs, method, requestBody
-                            , responseBody
-                            )
+import Network.HTTP.Conduit (Manager, responseBody)
 import System.Random (StdGen, newStdGen, randomR)
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.HashMap.Strict as HM
@@ -22,20 +20,22 @@ import Constellation.Enclave.Payload
     (EncryptedPayload(eplSender, eplRcptBoxes), eplRcptBoxes)
 import Constellation.Enclave.Types (PublicKey(PublicKey, unPublicKey))
 import Constellation.Node.Types
+import Constellation.Util.Either (maybeToExceptT)
 import Constellation.Util.Exception (trys)
-import Constellation.Util.Logging (logf)
+import Constellation.Util.Http (simplePostLbs)
+import Constellation.Util.Logging (logf, warnf)
 
 newNode :: Crypt
         -> Storage
         -> Text
         -> [PublicKey]
         -> [PublicKey]
+        -> PublicKey
         -> [Text]
+        -> Manager
+        -> Bool
         -> IO Node
-newNode crypt storage url rcpts alwaysSendTo parties = do
-    manager <- newManager tlsManagerSettings
-        { managerConnCount = 100
-        }
+newNode crypt storage url rcpts alwaysSendTo selfPub parties m setSecure =
     return Node
         { nodePi           = PartyInfo
               { piUrl     = url
@@ -44,8 +44,11 @@ newNode crypt storage url rcpts alwaysSendTo parties = do
               }
         , nodeCrypt        = crypt
         , nodeStorage      = storage
+        , nodeDefaultPub   = listToMaybe rcpts  -- the first public key listed
         , nodeAlwaysSendTo = alwaysSendTo
-        , nodeManager      = manager
+        , nodeSelfPub      = selfPub
+        , nodeSetSecure    = setSecure
+        , nodeManager      = m
         }
 
 runNode :: TVar Node -> IO ()
@@ -84,21 +87,18 @@ nodeRefresh nvar = do
     epis <- mapM
         (getRemotePartyInfo nvar)
         (HS.toList $ HS.delete piUrl piParties)
-    let pis = rights epis
-    atomically $ mergePartyInfos nvar pis
+    let (ls, rs) = partitionEithers epis
+    forM_ ls $ \err -> warnf "Synchronization failed: {}" [err]
+    atomically $ mergePartyInfos nvar rs
 
 getRemotePartyInfo :: TVar Node -> Text -> IO (Either String PartyInfo)
 getRemotePartyInfo nvar url = trys $ do
     logf "Starting synchronization with {}" [url]
     Node{..} <- atomically $ readTVar nvar
-    req      <- parseRequest $ T.unpack url ++ "partyinfo"
-    let req' = req
-            { method      = "POST"
-            , requestBody = RequestBodyLBS $ encode nodePi
-            }
-    res <- httpLbs req' nodeManager
+    res      <- simplePostLbs nodeManager nodeSetSecure
+        (T.unpack url ++ "partyinfo") (encode nodePi)
     logf "Finished synchronization with {}" [url]
-    return $ decode $ responseBody res
+    evaluate $ decode (responseBody res)
 
 mergePartyInfos :: TVar Node -> [PartyInfo] -> STM ()
 mergePartyInfos nvar pinfos = modifyTVar nvar $ \node ->
@@ -123,19 +123,25 @@ addParty url nvar = modifyTVar nvar $ \node ->
 
 sendPayload :: Node
             -> ByteString
-            -> PublicKey
+            -> Maybe PublicKey
             -> [PublicKey]
             -> IO [Either String Text]
-sendPayload node@Node{..} pl from initRcpts = do
-    let rcpts = nodeAlwaysSendTo ++ initRcpts
-    eenc <- encryptPayload nodeCrypt pl from rcpts
-    case eenc of
-        Left err  -> return [Left err]
-        Right epl -> do
-            ek <- savePayload nodeStorage (epl, rcpts)
-            case ek of
-                Left err -> return [Left err]
-                Right _  -> propagatePayload' node epl rcpts
+sendPayload node@Node{..} pl mSpecifiedFrom givenRcpts = do
+    let mFrom             = mSpecifiedFrom <|> nodeDefaultPub
+        (onlySelf, rcpts) = if null allRcpts
+            then (True, [nodeSelfPub])
+            else (False, allRcpts)
+        allRcpts          = nodeAlwaysSendTo ++ givenRcpts
+    eTup <- runExceptT $ do
+        from <- maybeToExceptT "sendPayload: No default From public key found and none was given" mFrom
+        epl <- ExceptT $ encryptPayload nodeCrypt pl from rcpts
+        k <- ExceptT $ savePayload nodeStorage (epl, rcpts)
+        return (epl, k)
+    case eTup of
+        Left err       -> return [Left err]
+        Right (epl, k) -> if onlySelf
+            then return [Right k]
+            else propagatePayload' node epl rcpts
 
 propagatePayload :: TVar Node
                  -> EncryptedPayload
@@ -154,16 +160,9 @@ propagatePayload' Node{..} epl rcpts =
     -- TODO: Smarter grouping of requests
     f (pub, rcptBox) = trys $ case HM.lookup pub (piRcpts nodePi) of
         Nothing  -> error "Unknown recipient"
-        Just url -> do
-            req <- parseRequest $ T.unpack url ++ "push"
-            let req' = req
-                    { method      = "POST"
-                    , requestBody = RequestBodyLBS $ encode epl
-                          { eplRcptBoxes = [rcptBox]
-                          }
-                    }
-            res <- httpLbs req' nodeManager
-            return $ TE.decodeUtf8 $ BL.toStrict $ responseBody res
+        Just url -> TE.decodeUtf8 . BL.toStrict . responseBody <$>
+            simplePostLbs nodeManager nodeSetSecure (T.unpack url ++ "push")
+            (encode epl { eplRcptBoxes = [rcptBox] })
 
 receivePayload :: Node -> Text -> PublicKey -> IO (Either String ByteString)
 receivePayload Node{..} key to = do
